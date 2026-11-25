@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18">
+  <!-- Window, with its bottom-right corner erased -->
+  <path d="M13 5.8 V4 A2 2 0 0 0 11 2 H3 A2 2 0 0 0 1 4 V10 A2 2 0 0 0 3 12 H6.8"
+        fill="none" stroke="#000" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M1 5 H13" fill="none" stroke="#000" stroke-width="1.1" stroke-linecap="round"/>
+  <!-- Eraser -->
+  <path d="M8.39 11.79 L14.05 6.13 L16.87 8.96 L11.21 14.61 Z"
+        fill="none" stroke="#000" stroke-width="1.3" stroke-linejoin="round"/>
+  <path d="M8.39 11.79 L10.51 9.67 L13.33 12.49 L11.21 14.61 Z" fill="#000"/>
+  <!-- Eraser crumbs -->
+  <circle cx="6.3" cy="14.4" r="0.75" fill="#000"/>
+  <circle cx="8.3" cy="16.4" r="0.65" fill="#000"/>
+  <circle cx="4.4" cy="16.2" r="0.55" fill="#000"/>
+</svg>
