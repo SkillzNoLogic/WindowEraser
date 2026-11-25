@@ -70,6 +70,19 @@ use 4- or 5-finger gestures to avoid triggering it.
 
 ## Limitations
 
+- **Fullscreen apps need Accessibility access.** A fullscreen app has its own Space, which
+  Mission Control keeps showing even when the app is hidden. With Accessibility access
+  (click **Allow** in the menu), WindowEraser takes the app out of fullscreen before hiding it
+  and puts it back when you show it.
+- **Some fullscreen games refuse to leave fullscreen** (games built on SDL, such as Celeste).
+  The menu marks them with a warning. Play in windowed mode, or add this to the game's Steam
+  launch options (**Properties → Launch Options**) and relaunch it:
+  ```
+  SDL_VIDEO_MAC_FULLSCREEN_SPACES=0 %command%
+  ```
+- **Windows games run through CrossOver/Wine aren't supported.** They run inside Wine, not as
+  their own Mac apps.
+
 - **Whole apps, not single windows.** macOS has no public API for removing one window of another
   app from Mission Control, so WindowEraser hides the entire app.
 - **Dock and Cmd-Tab.** A hidden app that's running still has a Dock icon and a Cmd-Tab entry.

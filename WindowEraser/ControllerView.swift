@@ -50,11 +50,11 @@ struct ControllerView: View {
                         Divider()
                         ForEach(stash.openApps, id: \.processIdentifier) { app in
                             Label {
-                                Text(app.localizedName ?? app.bundleIdentifier ?? "App")
+                                Text(app.localizedName ?? "App")
                             } icon: {
                                 Image(nsImage: menuIcon(app.icon))
                             }
-                            .tag(app.bundleIdentifier)
+                            .tag(StashManager.key(for: app))
                         }
                     }
                     .labelsHidden()
@@ -101,6 +101,17 @@ struct ControllerView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("WindowEraser").font(.headline)
+            if !stash.accessibilityTrusted {
+                HStack {
+                    Label("Fullscreen apps need Accessibility access", systemImage: "lock.shield")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Allow") { stash.requestAccessibility() }
+                        .controlSize(.small)
+                        .help("Lets WindowEraser take apps out of fullscreen before hiding them, so their Space leaves Mission Control")
+                }
+            }
             if !gestureAvailable {
                 Label("Trackpad gestures are unavailable on this Mac.", systemImage: "exclamationmark.triangle")
                     .font(.callout)
@@ -126,7 +137,17 @@ struct ControllerView: View {
                     .foregroundStyle(.secondary)
             }
             ForEach(entries) { entry in
-                AppRow(icon: entry.icon, name: entry.name, detail: detail(for: entry)) {
+                AppRow(icon: entry.icon, name: entry.name, detail: detail(for: entry),
+                       detailColor: entry.isStuckFullscreen ? .orange : .secondary) {
+                    if entry.isStuckFullscreen {
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(Self.fullscreenFix, forType: .string)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                        }
+                        .help("This app won't leave fullscreen, so its Space stays in Mission Control. Click to copy a Steam launch option that fixes this for most games (Properties → Launch Options), then relaunch the game. Or play in windowed mode.")
+                    }
                     Button {
                         stash.toggle(entry.id)
                     } label: {
@@ -168,10 +189,10 @@ struct ControllerView: View {
             SectionTitle("Running apps")
             ForEach(stash.visibleApps, id: \.processIdentifier) { app in
                 AppRow(icon: app.icon ?? NSWorkspace.shared.icon(for: .application),
-                       name: app.localizedName ?? app.bundleIdentifier ?? "App",
+                       name: app.localizedName ?? "App",
                        detail: nil) {
                     Button("Hide") {
-                        if let id = app.bundleIdentifier { stash.hide(bundleID: id) }
+                        if let id = StashManager.key(for: app) { stash.hide(id) }
                     }
                 }
             }
@@ -206,8 +227,12 @@ struct ControllerView: View {
         .padding(14)
     }
 
+    /// Steam launch option that makes SDL games go fullscreen without their own Space.
+    private static let fullscreenFix = "SDL_VIDEO_MAC_FULLSCREEN_SPACES=0 %command%"
+
     private func detail(for entry: HiddenEntry) -> String {
         if entry.isShowing { return "Showing" }
+        if entry.isStuckFullscreen { return "Fullscreen: still in Mission Control" }
         return entry.isRunning ? "Hidden" : "Hidden · not running"
     }
 
@@ -226,9 +251,7 @@ struct ControllerView: View {
         panel.prompt = "Hide"
         NSApp.activate()
         guard panel.runModal() == .OK else { return }
-        for url in panel.urls {
-            if let id = Bundle(url: url)?.bundleIdentifier { stash.hide(bundleID: id) }
-        }
+        for url in panel.urls { stash.addApp(at: url) }
     }
 }
 
@@ -247,6 +270,7 @@ private struct AppRow<Actions: View>: View {
     let icon: NSImage
     let name: String
     let detail: String?
+    var detailColor: Color = .secondary
     @ViewBuilder let actions: Actions
 
     var body: some View {
@@ -257,7 +281,7 @@ private struct AppRow<Actions: View>: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(name).lineLimit(1)
                 if let detail {
-                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                    Text(detail).font(.caption).foregroundStyle(detailColor)
                 }
             }
             Spacer()
