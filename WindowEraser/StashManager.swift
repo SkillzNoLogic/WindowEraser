@@ -58,7 +58,6 @@ final class StashManager {
     /// refusals it isn't asked again this session. One miss can just be bad timing, e.g.
     /// hiding an app mid-way through its enter-fullscreen animation.
     @ObservationIgnored private var fullscreenRefusals: [String: Int] = [:]
-    @ObservationIgnored private var askedForAccessibility = false
 
     private enum Keys {
         static let hidden = "hiddenBundleIDs"
@@ -101,13 +100,14 @@ final class StashManager {
             }
             observers.append(token)
         }
-        // Safety net for anything that slips past the notifications.
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.refreshFullscreen()
-                self?.enforceAll()
-            }
+        // Safety net for anything that slips past the notifications. It does nothing
+        // unless a hidden app is running, and the tolerance lets macOS batch its wake-ups.
+        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.safetyCheck() }
         }
+        timer.tolerance = 1
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
         pushGestures()
         refresh()
         // Apps already running when WindowEraser starts keep their saved hidden state.
@@ -116,18 +116,36 @@ final class StashManager {
     }
 
     func refresh() {
-        runningApps = NSWorkspace.shared.runningApplications.filter {
-            $0.activationPolicy == .regular && $0.processIdentifier != ownPID && Self.key(for: $0) != nil
-        }
+        runningApps = NSWorkspace.shared.runningApplications.filter(isEligible)
         rememberPaths()
         refreshFullscreen()
     }
 
+    /// Only ordinary apps (ones with a Dock icon) are ever hidden. Background processes and
+    /// helpers are left alone even if they share a bundle ID with a hidden app (for example
+    /// Steam's in-game overlay shares Steam's), and so is WindowEraser itself.
+    private func isEligible(_ app: NSRunningApplication) -> Bool {
+        app.activationPolicy == .regular && app.processIdentifier != ownPID && Self.key(for: app) != nil
+    }
+
+    private var hiddenAppIsRunning: Bool {
+        runningApps.contains { Self.key(for: $0).map(hiddenIDs.contains) ?? false }
+    }
+
+    /// Reads which apps own a fullscreen Space, but only when a hidden app is running
+    /// (that's the only time the answer is used).
     private func refreshFullscreen() {
-        let pids = Fullscreen.spaceOwnerPIDs() ?? []
+        let pids = hiddenAppIsRunning ? (Fullscreen.spaceOwnerPIDs() ?? []) : []
         if pids != fullscreenPIDs { fullscreenPIDs = pids }
         let trusted = Fullscreen.isTrusted
         if trusted != accessibilityTrusted { accessibilityTrusted = trusted }
+    }
+
+    private func safetyCheck() {
+        guard !hiddenIDs.isEmpty else { return }
+        refresh()
+        guard hiddenAppIsRunning else { return }
+        enforceAll()
     }
 
     private func rememberPaths() {
@@ -287,11 +305,9 @@ final class StashManager {
             app.hide()
             return
         }
+        // Without Accessibility access it can't leave fullscreen. It's hidden anyway, and the
+        // menu shows the Allow button rather than a surprise system prompt.
         guard Fullscreen.isTrusted else {
-            if !askedForAccessibility {
-                askedForAccessibility = true
-                Fullscreen.promptForTrust()
-            }
             app.hide()
             refreshFullscreen()
             return
@@ -354,8 +370,11 @@ final class StashManager {
     // MARK: - Enforcement
 
     private func handle(_ name: Notification.Name, pid: pid_t?, key: String?) {
-        refresh()
         guard let pid, pid != ownPID else { return }
+        if name == NSWorkspace.didLaunchApplicationNotification || name == NSWorkspace.didTerminateApplicationNotification
+            || !hiddenIDs.isEmpty {
+            refresh()
+        }
 
         // The process is already gone here, so this case can't look the app up by PID.
         if name == NSWorkspace.didTerminateApplicationNotification {
@@ -386,19 +405,21 @@ final class StashManager {
     }
 
     private func enforce(_ app: NSRunningApplication) {
+        guard isEligible(app) else { return }
         noteLaunchIfNew(app)
         guard let id = Self.key(for: app), hiddenIDs.contains(id), !revealedIDs.contains(id), !app.isHidden else { return }
         hideApp(app)
     }
 
     private func enforceAll() {
-        for app in NSWorkspace.shared.runningApplications { enforce(app) }
+        guard !hiddenIDs.isEmpty else { return }
+        for app in runningApps { enforce(app) }
     }
 
     // MARK: - Helpers
 
     private func apps(withID id: String) -> [NSRunningApplication] {
-        NSWorkspace.shared.runningApplications.filter { Self.key(for: $0) == id }
+        NSWorkspace.shared.runningApplications.filter { isEligible($0) && Self.key(for: $0) == id }
     }
 
     /// Where to launch a saved app from. The remembered path wins over a Launch Services

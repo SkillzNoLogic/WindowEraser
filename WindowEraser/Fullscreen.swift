@@ -55,7 +55,7 @@ enum Fullscreen {
     /// but do expose their main/focused window, so those are used as a fallback.
     static func windows(of pid: pid_t) -> [AXUIElement] {
         let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 1)
+        AXUIElementSetMessagingTimeout(app, 0.5)  // never stall the menu on an unresponsive app
         var result: [AXUIElement] = []
         var value: CFTypeRef?
         if AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,

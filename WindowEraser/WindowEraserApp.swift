@@ -15,27 +15,27 @@ import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let stash = StashManager()
-    private var deviceTimer: Timer?
     private static weak var current: AppDelegate?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Self.current = self
-        stash.start()
-
-        let monitor = GestureMonitor.shared
-        monitor.setHandler { gesture in
+        // The handler goes in first. The trackpads are only opened once the saved
+        // gestures are loaded in `stash.start()`, and only if there are any.
+        GestureMonitor.shared.setHandler { gesture in
             Task { @MainActor in AppDelegate.current?.stash.handle(gesture) }
         }
-        monitor.start()
+        stash.start()
 
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-        ) { _ in
-            GestureMonitor.shared.restart()
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { _ in
+            GestureMonitor.shared.systemWillSleep()
         }
-        // Pick up trackpads that are connected or disconnected while running.
-        deviceTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
-            GestureMonitor.shared.restartIfDevicesChanged()
+        center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
+            GestureMonitor.shared.systemDidWake()
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        GestureMonitor.shared.shutDown()
     }
 }

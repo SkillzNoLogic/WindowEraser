@@ -1,4 +1,5 @@
 import Foundation
+import IOKit
 
 // Raw trackpad touch data from Apple's private MultitouchSupport framework.
 // This is the same source tools like BetterTouchTool use: it sees every finger on
@@ -34,6 +35,12 @@ nonisolated struct MTTouch {
 }
 
 /// Recognizes the `TrackpadGesture`s that are currently assigned, on any connected trackpad.
+///
+/// To stay out of the way it only listens when it has to:
+/// - only to trackpads (a Magic Mouse is also a multitouch device, and is skipped)
+/// - only while at least one gesture is assigned
+/// - not while the Mac sleeps
+/// Plugging trackpads in or out is picked up from IOKit notifications, not by polling.
 nonisolated final class GestureMonitor: @unchecked Sendable {
     static let shared = GestureMonitor()
 
@@ -45,6 +52,7 @@ nonisolated final class GestureMonitor: @unchecked Sendable {
     private typealias RegisterFn = @convention(c) (UnsafeMutableRawPointer, ContactCallback) -> Void
     private typealias StartFn = @convention(c) (UnsafeMutableRawPointer, Int32) -> Int32
     private typealias StopFn = @convention(c) (UnsafeMutableRawPointer) -> Int32
+    private typealias DeviceIDFn = @convention(c) (UnsafeMutableRawPointer, UnsafeMutablePointer<UInt64>) -> Int32
 
     // Tuning.
     private let maxTapDuration = 0.45   // seconds from first finger down to last finger up
@@ -83,8 +91,15 @@ nonisolated final class GestureMonitor: @unchecked Sendable {
     private var unregister: RegisterFn?
     private var startDevice: StartFn?
     private var stopDevice: StopFn?
+    private var deviceID: DeviceIDFn?
     private var deviceList: CFArray?
+    // Device handling below happens on the main thread only.
     private var devices: [UnsafeMutableRawPointer] = []
+    private var isSleeping = false
+    private var notifyPort: IONotificationPortRef?
+    private var addedIterator: io_iterator_t = 0
+    private var removedIterator: io_iterator_t = 0
+    private var pendingRefresh: DispatchWorkItem?
     private let callback: ContactCallback
 
     private init() {
@@ -102,6 +117,7 @@ nonisolated final class GestureMonitor: @unchecked Sendable {
         unregister = load("MTUnregisterContactFrameCallback", as: RegisterFn.self)
         startDevice = load("MTDeviceStart", as: StartFn.self)
         stopDevice = load("MTDeviceStop", as: StopFn.self)
+        deviceID = load("MTDeviceGetDeviceID", as: DeviceIDFn.self)
     }
 
     var isAvailable: Bool { createList != nil && register != nil && startDevice != nil }
@@ -111,29 +127,63 @@ nonisolated final class GestureMonitor: @unchecked Sendable {
     }
 
     /// Only gestures in this set are reported. This also decides whether a double tap
-    /// must wait to see if a triple tap follows.
+    /// must wait to see if a triple tap follows. With no gestures assigned, the trackpads
+    /// aren't listened to at all. Call on the main thread.
     func setEnabledGestures(_ gestures: Set<TrackpadGesture>) {
         lock.withLock {
             enabled = gestures
             sessions.removeAll()
         }
+        updateListening()
     }
 
-    func start() {
+    /// Starts or stops listening to match what's needed. Call on the main thread.
+    func updateListening() {
+        let wanted = !isSleeping && !lock.withLock { enabled.isEmpty }
+        if wanted, devices.isEmpty {
+            start()
+        } else if !wanted, !devices.isEmpty {
+            stop()
+        }
+    }
+
+    func systemWillSleep() {
+        isSleeping = true
+        stop()
+    }
+
+    /// Touch devices stop reporting across sleep, so they're reopened on wake.
+    func systemDidWake() {
+        isSleeping = false
+        stop()
+        updateListening()
+    }
+
+    func shutDown() {
+        stop()
+        if let notifyPort { IONotificationPortDestroy(notifyPort) }
+        notifyPort = nil
+    }
+
+    private func start() {
         guard isAvailable, devices.isEmpty, let createList, let register, let startDevice,
               let raw = createList() else { return }
         let list = Unmanaged<CFArray>.fromOpaque(raw).takeRetainedValue()
         deviceList = list
+        let mice = Self.mouseMultitouchIDs()
         for i in 0..<CFArrayGetCount(list) {
             guard let value = CFArrayGetValueAtIndex(list, i) else { continue }
             let device = UnsafeMutableRawPointer(mutating: value)
+            var id: UInt64 = 0
+            if let deviceID, deviceID(device, &id) == 0, mice.contains(id) { continue }
             register(device, callback)
             _ = startDevice(device, 0)
             devices.append(device)
         }
+        watchForDeviceChanges()
     }
 
-    func stop() {
+    private func stop() {
         for device in devices {
             unregister?(device, callback)
             _ = stopDevice?(device)
@@ -143,17 +193,68 @@ nonisolated final class GestureMonitor: @unchecked Sendable {
         lock.withLock { sessions.removeAll() }
     }
 
-    /// Touch devices stop reporting after sleep and new trackpads aren't picked up
-    /// automatically, so this is called on wake and periodically.
-    func restart() {
-        stop()
-        start()
+    /// Multitouch IDs of mice (Magic Mouse). Each multitouch device's IOKit parent is its
+    /// HID event driver, which says whether it's a mouse or a trackpad.
+    private static func mouseMultitouchIDs() -> Set<UInt64> {
+        var ids = Set<UInt64>()
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("AppleMultitouchDevice"), &iterator) == KERN_SUCCESS else {
+            return ids
+        }
+        defer { IOObjectRelease(iterator) }
+        var service = IOIteratorNext(iterator)
+        while service != 0 {
+            var parent: io_registry_entry_t = 0
+            if IORegistryEntryGetParentEntry(service, kIOServicePlane, &parent) == KERN_SUCCESS {
+                if IOObjectConformsTo(parent, "AppleMultitouchMouseHIDEventDriver") != 0,
+                   let value = IORegistryEntryCreateCFProperty(service, "Multitouch ID" as CFString, kCFAllocatorDefault, 0)?
+                       .takeRetainedValue() as? NSNumber {
+                    ids.insert(value.uint64Value)
+                }
+                IOObjectRelease(parent)
+            }
+            IOObjectRelease(service)
+            service = IOIteratorNext(iterator)
+        }
+        return ids
     }
 
-    func restartIfDevicesChanged() {
-        guard let createList, let raw = createList() else { return }
-        let count = CFArrayGetCount(Unmanaged<CFArray>.fromOpaque(raw).takeRetainedValue())
-        if count != devices.count { restart() }
+    /// Asks IOKit to report multitouch devices being added or removed, instead of polling.
+    private func watchForDeviceChanges() {
+        guard notifyPort == nil, let port = IONotificationPortCreate(kIOMainPortDefault) else { return }
+        notifyPort = port
+        CFRunLoopAddSource(CFRunLoopGetMain(), IONotificationPortGetRunLoopSource(port).takeUnretainedValue(), .commonModes)
+        let changed: IOServiceMatchingCallback = { _, iterator in
+            GestureMonitor.drain(iterator)
+            GestureMonitor.shared.devicesChanged()
+        }
+        IOServiceAddMatchingNotification(port, kIOFirstMatchNotification, IOServiceMatching("AppleMultitouchDevice"),
+                                         changed, nil, &addedIterator)
+        Self.drain(addedIterator)  // Arms the notification; current devices are already open.
+        IOServiceAddMatchingNotification(port, kIOTerminatedNotification, IOServiceMatching("AppleMultitouchDevice"),
+                                         changed, nil, &removedIterator)
+        Self.drain(removedIterator)
+    }
+
+    private static func drain(_ iterator: io_iterator_t) {
+        var service = IOIteratorNext(iterator)
+        while service != 0 {
+            IOObjectRelease(service)
+            service = IOIteratorNext(iterator)
+        }
+    }
+
+    /// Runs on the main run loop. Waits briefly so a device that's still connecting is ready.
+    private func devicesChanged() {
+        pendingRefresh?.cancel()
+        let work = DispatchWorkItem { [self] in
+            // Reopen from scratch. This also catches a trackpad plugged in while nothing was
+            // open (say, only a Magic Mouse was connected).
+            stop()
+            updateListening()
+        }
+        pendingRefresh = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
     }
 
     // Called on the framework's touch thread for every frame.
@@ -162,18 +263,21 @@ nonisolated final class GestureMonitor: @unchecked Sendable {
         var scheduleDouble: (key: Int, sequence: Int, gesture: TrackpadGesture)?
 
         lock.lock()
+        guard !enabled.isEmpty else {
+            lock.unlock()
+            return
+        }
         let key = Int(bitPattern: device)
         var s = sessions[key] ?? Session()
 
-        var down: [MTTouch] = []
-        if let touches, count > 0 {
-            let buffer = touches.assumingMemoryBound(to: MTTouch.self)
-            for i in 0..<count where (3...5).contains(buffer[i].state) {
-                down.append(buffer[i])
-            }
+        // Fingers actually touching (states 3...5); others are hovering or lifting off.
+        let buffer = touches?.assumingMemoryBound(to: MTTouch.self)
+        var downCount = 0
+        if let buffer {
+            for i in 0..<count where (3...5).contains(buffer[i].state) { downCount += 1 }
         }
 
-        if !down.isEmpty {
+        if let buffer, downCount > 0 {
             if !s.active {
                 s.active = true
                 s.startTime = timestamp
@@ -183,11 +287,12 @@ nonisolated final class GestureMonitor: @unchecked Sendable {
                 s.drift = 0
                 s.holdFired = false
             }
-            if down.count > s.maxFingers {
-                s.maxFingers = down.count
+            if downCount > s.maxFingers {
+                s.maxFingers = downCount
                 s.fullTime = timestamp
             }
-            for touch in down {
+            for i in 0..<count where (3...5).contains(buffer[i].state) {
+                let touch = buffer[i]
                 let p = touch.normalized.position
                 if let o = s.origins[touch.identifier] {
                     s.drift = max(s.drift, hypotf(p.x - o.x, p.y - o.y))
@@ -195,7 +300,7 @@ nonisolated final class GestureMonitor: @unchecked Sendable {
                     s.origins[touch.identifier] = p
                 }
             }
-            if !s.holdFired, down.count == s.maxFingers, s.drift <= maxDrift,
+            if !s.holdFired, downCount == s.maxFingers, s.drift <= maxDrift,
                timestamp - s.fullTime >= holdDuration,
                let hold = TrackpadGesture.hold(fingers: s.maxFingers), enabled.contains(hold) {
                 s.holdFired = true
